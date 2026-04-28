@@ -58,7 +58,10 @@ def make_beta_schedule(schedule="linear", num_timesteps=1000, start=1e-5, end=1e
     elif schedule == "cosine_anneal":
         betas = torch.tensor(
             [
-                start + 0.5 * (end - start) * (1 - math.cos(t / (num_timesteps - 1) * math.pi))
+                start
+                + 0.5
+                * (end - start)
+                * (1 - math.cos(t / (num_timesteps - 1) * math.pi))
                 for t in range(num_timesteps)
             ]
         )
@@ -104,7 +107,7 @@ def q_sample_residual(
         + (1 - sqrt(alpha_bar_t)) * r_prior
         + sqrt(1 - alpha_bar_t) * noise
 
-    In V1/V2:
+    In V1:
         r_prior = 0
     """
     if noise is None:
@@ -127,6 +130,15 @@ def _get_raw_model(model):
     Support both normal model and DataParallel model.
     """
     return model.module if hasattr(model, "module") else model
+
+
+def _get_sample_temperature(model):
+    """
+    Read sampling temperature from model.args.
+    Default = 1.0, which recovers the original sampling behavior.
+    """
+    raw_model = _get_raw_model(model)
+    return float(getattr(raw_model.args, "sample_temperature", 1.0))
 
 
 def _make_sampling_timestep(t, batch_size, device):
@@ -167,15 +179,21 @@ def p_sample_residual(
     """
     One reverse step for residual diffusion.
 
-    V1/V2 compatible model call:
+    V1 compatible model call:
         eps_theta = model(x, x_mark, y_base, r_t, r_prior, t_tensor)
 
     The model predicts eps_theta.
+
+    sample_temperature:
+        temperature > 1.0 makes residual samples more diverse.
+        temperature < 1.0 makes residual samples more concentrated.
     """
     raw_model = _get_raw_model(model)
     device = next(raw_model.parameters()).device
+    temperature = _get_sample_temperature(model)
 
-    z = torch.randn_like(r_t).to(device)
+    # Temperature-scaled reverse noise.
+    z = temperature * torch.randn_like(r_t).to(device)
 
     t_tensor = _make_sampling_timestep(
         t=t,
@@ -256,8 +274,11 @@ def p_sample_residual_t_1to0(
     """
     Final reverse step from t=1 to t=0.
 
-    V1/V2 compatible:
+    V1 compatible:
         model(x, x_mark, y_base, r_t, r_prior, t_tensor)
+
+    Note:
+        No extra sampling noise is added at the final t=0 reconstruction step.
     """
     raw_model = _get_raw_model(model)
     device = next(raw_model.parameters()).device
@@ -303,6 +324,7 @@ def p_sample_loop_residual(
     n_steps,
     alphas,
     one_minus_alphas_bar_sqrt,
+    return_sequence=False,
 ):
     """
     Sample from p(r_0 | x, y_base).
@@ -312,69 +334,65 @@ def p_sample_loop_residual(
         Residual Patch Transformer
         noise loss
 
-    V2:
-        r_prior = 0
-        Residual Patch Transformer
-        noise loss + r0 loss
+    sample_temperature:
+        Applied to:
+            1. initial residual noise r_T
+            2. reverse step noise z
 
-    Note:
-        The r0 reconstruction head in V2 is only used during training.
-        Sampling still uses eps prediction for DDPM reverse process.
+    Memory-saving behavior:
+        return_sequence=False returns [r0] only.
+        This avoids storing all reverse states during testing.
 
-    New interface:
-        p_sample_loop_residual(
-            model,
-            x,
-            x_mark,
-            y_base,
-            r_prior,
-            n_steps,
-            alphas,
-            one_minus_alphas_bar_sqrt,
-        )
+    Existing caller remains valid:
+        r_tile_seq = p_sample_loop_residual(...)
+        gen_r = r_tile_seq[-1]
     """
     raw_model = _get_raw_model(model)
     device = next(raw_model.parameters()).device
+    temperature = _get_sample_temperature(model)
 
-    z = torch.randn_like(r_prior).to(device)
+    # Temperature-scaled initial noise.
+    z = temperature * torch.randn_like(r_prior).to(device)
 
-    # r_T ~ N(r_prior, I)
+    # r_T ~ N(r_prior, temperature^2 I)
     cur_r = z + r_prior
 
-    r_seq = [cur_r]
+    if return_sequence:
+        r_seq = [cur_r]
+    else:
+        r_seq = None
 
     for t in reversed(range(1, n_steps)):
-        r_t = cur_r
-
         cur_r = p_sample_residual(
             model=model,
             x=x,
             x_mark=x_mark,
             y_base=y_base,
-            r_t=r_t,
+            r_t=cur_r,
             r_prior=r_prior,
             t=t,
             alphas=alphas,
             one_minus_alphas_bar_sqrt=one_minus_alphas_bar_sqrt,
         )
 
-        r_seq.append(cur_r)
-
-    assert len(r_seq) == n_steps
+        if return_sequence:
+            r_seq.append(cur_r)
 
     r0 = p_sample_residual_t_1to0(
         model=model,
         x=x,
         x_mark=x_mark,
         y_base=y_base,
-        r_t=r_seq[-1],
+        r_t=cur_r,
         r_prior=r_prior,
         one_minus_alphas_bar_sqrt=one_minus_alphas_bar_sqrt,
     )
 
-    r_seq.append(r0)
+    if return_sequence:
+        r_seq.append(r0)
+        return r_seq
 
-    return r_seq
+    return [r0]
 
 
 def kld(y1, y2, grid=(-20, 20), num_grid=400):
