@@ -56,7 +56,27 @@ if __name__ == '__main__':
     parser.add_argument('--k_z', type=float, default=1e-2, help='KL weight 1e-9')
     parser.add_argument('--k_cond', type=float, default=1, help='Condition weight')
     parser.add_argument('--d_z', type=int, default=8, help='KL weight')
+    #新增参数
+    parser.add_argument('--lambda_r0', type=float, default=0.1,
+                    help='weight for residual r0 reconstruction loss')
 
+    parser.add_argument('--simpatch_d_model', type=int, default=128,
+                        help='hidden dimension for residual patch denoiser')
+    
+    parser.add_argument('--simpatch_layers', type=int, default=1,
+                        help='number of Transformer encoder layers in residual patch denoiser')
+    
+    parser.add_argument('--simpatch_heads', type=int, default=4,
+                        help='number of attention heads in residual patch denoiser')
+    
+    parser.add_argument('--simpatch_d_ff', type=int, default=256,
+                        help='feed-forward dimension in residual patch denoiser')
+    
+    parser.add_argument('--patch_len', type=int, default=16,
+                        help='patch length for residual patch denoiser')
+    
+    parser.add_argument('--stride', type=int, default=8,
+                        help='patch stride for residual patch denoiser')
 
     # optimization
     parser.add_argument('--num_workers', type=int, default=4, help='data loader num workers')
