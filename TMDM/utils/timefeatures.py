@@ -70,7 +70,8 @@ class WeekOfYear(TimeFeature):
     """Week of year encoded as value between [-0.5, 0.5]"""
 
     def __call__(self, index: pd.DatetimeIndex) -> np.ndarray:
-        return (index.isocalendar().week - 1) / 52.0 - 0.5
+        week = index.isocalendar().week.to_numpy(dtype=np.float32)
+        return (week - 1) / 52.0 - 0.5
 
 
 def time_features_from_frequency_str(freq_str: str) -> List[TimeFeature]:
@@ -131,4 +132,6 @@ def time_features_from_frequency_str(freq_str: str) -> List[TimeFeature]:
 
 
 def time_features(dates, freq='h'):
-    return np.vstack([feat(dates) for feat in time_features_from_frequency_str(freq)])
+    dates = pd.DatetimeIndex(dates)
+    feats = [np.asarray(feat(dates), dtype=np.float32) for feat in time_features_from_frequency_str(freq)]
+    return np.vstack(feats).astype(np.float32)
