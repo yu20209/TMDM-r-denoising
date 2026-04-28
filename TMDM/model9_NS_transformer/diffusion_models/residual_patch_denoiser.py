@@ -1,5 +1,7 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ResidualPatchDenoiser(nn.Module):
@@ -30,9 +32,6 @@ class ResidualPatchDenoiser(nn.Module):
         self.patch_len = getattr(args, "patch_len", 16)
         self.stride = getattr(args, "stride", 8)
 
-        # Important:
-        # Use denoiser-specific hidden size instead of args.d_model.
-        # This avoids making the residual denoiser as heavy as NS-Transformer.
         self.d_model = getattr(args, "simpatch_d_model", 128)
         self.n_heads = getattr(args, "simpatch_heads", 4)
         self.n_layers = getattr(args, "simpatch_layers", 1)
@@ -69,34 +68,71 @@ class ResidualPatchDenoiser(nn.Module):
         self.eps_head = nn.Linear(self.d_model, self.patch_len)
         self.r0_head = nn.Linear(self.d_model, self.patch_len)
 
+    def _get_pad_len(self, length):
+        """
+        Compute right padding so that unfold covers the full sequence.
+
+        Need:
+            last_start + patch_len >= length
+
+        For unfold with step=stride, number of patches is:
+            N = ceil((length - patch_len) / stride) + 1, if length > patch_len
+            N = 1, if length <= patch_len
+
+        padded length:
+            (N - 1) * stride + patch_len
+        """
+        if length <= self.patch_len:
+            padded_len = self.patch_len
+        else:
+            n_patches = math.ceil((length - self.patch_len) / self.stride) + 1
+            padded_len = (n_patches - 1) * self.stride + self.patch_len
+
+        return padded_len - length
+
     def patchify(self, x):
         """
         x: [B, L]
-        return: [B, N, patch_len]
+        return:
+            patches: [B, N, patch_len]
+            original_length: int
         """
-        L = x.shape[-1]
+        length = x.shape[-1]
+        pad_len = self._get_pad_len(length)
 
-        # If L is shorter than patch_len, pad right.
-        if L < self.patch_len:
-            pad_len = self.patch_len - L
-            x = torch.nn.functional.pad(x, (0, pad_len), mode="replicate")
+        if pad_len > 0:
+            # Replicate-pad the tail to avoid introducing artificial zeros.
+            x = F.pad(x, (0, pad_len), mode="replicate")
 
-        return x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
 
-    def unpatchify(self, patches, length):
+        return patches, length
+
+    def unpatchify(self, patches, original_length):
         """
         Reconstruct sequence from overlapping patches by averaging overlaps.
 
-        patches: [B, N, patch_len]
-        length:  output sequence length
-        return:  [B, length]
+        patches:         [B, N, patch_len]
+        original_length: original sequence length before padding
+        return:          [B, original_length]
         """
         B, N, P = patches.shape
 
         full_len = (N - 1) * self.stride + self.patch_len
 
-        out = torch.zeros(B, full_len, device=patches.device, dtype=patches.dtype)
-        count = torch.zeros(B, full_len, device=patches.device, dtype=patches.dtype)
+        out = torch.zeros(
+            B,
+            full_len,
+            device=patches.device,
+            dtype=patches.dtype,
+        )
+
+        count = torch.zeros(
+            B,
+            full_len,
+            device=patches.device,
+            dtype=patches.dtype,
+        )
 
         for i in range(N):
             start = i * self.stride
@@ -106,7 +142,7 @@ class ResidualPatchDenoiser(nn.Module):
 
         out = out / (count + 1e-6)
 
-        return out[:, :length]
+        return out[:, :original_length]
 
     def forward(self, x, y_base, r_t, t, return_r0=False):
         """
@@ -122,8 +158,17 @@ class ResidualPatchDenoiser(nn.Module):
         r = r_t.permute(0, 2, 1).reshape(B * C, L)
         base = y_base.permute(0, 2, 1).reshape(B * C, L)
 
-        r_patches = self.patchify(r)
-        base_patches = self.patchify(base)
+        r_patches, r_len = self.patchify(r)
+        base_patches, base_len = self.patchify(base)
+
+        # Safety check: r_t and y_base should have the same pred_len.
+        if r_patches.shape[1] != base_patches.shape[1]:
+            raise RuntimeError(
+                f"Patch number mismatch: r_patches has {r_patches.shape[1]} patches, "
+                f"base_patches has {base_patches.shape[1]} patches. "
+                f"r_len={r_len}, base_len={base_len}, "
+                f"patch_len={self.patch_len}, stride={self.stride}"
+            )
 
         r_tokens = self.r_patch_embed(r_patches)
         base_tokens = self.base_patch_embed(base_patches)
@@ -132,6 +177,7 @@ class ResidualPatchDenoiser(nn.Module):
         # During sampling, diffusion_utils.py should expand t to [B].
         if t.dim() == 0:
             t = t.repeat(B)
+
         if t.numel() == 1:
             t = t.repeat(B)
 
